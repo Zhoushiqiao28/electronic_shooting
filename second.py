@@ -5,6 +5,7 @@ import serial
 import time
 import random
 from dataclasses import dataclass
+from serial.tools import list_ports
 from config import CONFIG
 
 
@@ -239,20 +240,81 @@ class ShotReceiver:
         self.use_serial = CONFIG["use_serial"]
         self.ser = None
         self.last_shot = 0
+        self.port_name = None
+        self.status_text = "Serial: disabled"
+        self.last_serial_line = ""
 
         if self.use_serial:
+            self.open_serial()
+
+    def serial_candidates(self):
+        candidates = []
+        configured_port = CONFIG.get("serial_port")
+
+        if configured_port:
+            candidates.append(configured_port)
+
+        for port in list_ports.comports():
+            if port.device not in candidates:
+                candidates.append(port.device)
+
+        return candidates
+
+    def open_serial(self):
+        errors = []
+
+        for port_name in self.serial_candidates():
             try:
                 self.ser = serial.Serial(
-                    CONFIG["serial_port"],
+                    port_name,
                     CONFIG["baudrate"],
                     timeout=0.01,
                 )
+                self.port_name = port_name
                 time.sleep(2)
-            except:
-                self.use_serial = False
+                self.ser.reset_input_buffer()
+                self.status_text = f"Serial: {port_name}"
+                return
+            except Exception as e:
+                errors.append(f"{port_name}: {e}")
+
+        self.use_serial = False
+
+        if errors:
+            self.status_text = f"Serial OFF: {errors[0]}"
+        else:
+            self.status_text = "Serial OFF: no ports found"
+
+    def poll_serial(self):
+        if not (self.use_serial and self.ser):
+            return False
+
+        shot_detected = False
+
+        try:
+            while self.ser.in_waiting:
+                line = self.ser.readline().decode(errors="ignore").strip()
+
+                if not line:
+                    continue
+
+                self.last_serial_line = line
+
+                if line == "SHOT":
+                    shot_detected = True
+        except Exception as e:
+            self.status_text = f"Serial OFF: {e}"
+            self.use_serial = False
+
+            if self.ser is not None:
+                self.ser.close()
+                self.ser = None
+
+        return shot_detected
 
     def poll(self):
         now = time.time()
+        serial_shot = self.poll_serial()
 
         if now - self.last_shot < CONFIG["shot_cooldown_sec"]:
             return False
@@ -262,13 +324,24 @@ class ShotReceiver:
             self.last_shot = now
             return True
 
-        if self.use_serial and self.ser and self.ser.in_waiting:
-            line = self.ser.readline().decode(errors="ignore").strip()
-            if line == "SHOT":
-                self.last_shot = now
-                return True
+        if serial_shot:
+            self.last_shot = now
+            return True
 
         return False
+
+    def debug_lines(self):
+        lines = [self.status_text]
+
+        if self.last_serial_line:
+            lines.append(f"RX: {self.last_serial_line}")
+
+        return lines
+
+    def release(self):
+        if self.ser is not None:
+            self.ser.close()
+            self.ser = None
 
 
 class Game:
@@ -286,6 +359,7 @@ class Game:
 
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont(None, 40)
+        self.small_font = pygame.font.SysFont(None, 28)
         self.big_font = pygame.font.SysFont(None, 70)
 
         self.tracker = LaserTracker()
@@ -539,6 +613,12 @@ class Game:
             (20, 140),
         )
 
+        for index, line in enumerate(self.receiver.debug_lines()):
+            self.screen.blit(
+                self.small_font.render(line, True, CONFIG["text_color"]),
+                (20, 185 + index * 28),
+            )
+
         if self.game_over:
 
             txt = self.big_font.render(
@@ -575,6 +655,7 @@ class Game:
             self.update(dt)
             self.draw()
 
+        self.receiver.release()
         self.tracker.release()
         pygame.quit()
 

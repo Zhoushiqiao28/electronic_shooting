@@ -2,10 +2,10 @@ from machine import Pin
 import time
 
 
-SHOT_PIN = 7
+SHOT_PIN = 0
 DEBOUNCE_MS = 30
 
-shot_switch = Pin(SHOT_PIN, Pin.IN, Pin.PULL_UP)
+shot_switch = Pin(SHOT_PIN, Pin.IN, Pin.PULL_DOWN)
 last_stable = shot_switch.value()
 last_reading = last_stable
 last_change_ms = time.ticks_ms()

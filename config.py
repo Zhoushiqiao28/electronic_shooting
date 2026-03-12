@@ -7,7 +7,7 @@ CONFIG = {
     "window_title": "Laser Balloon Game",
 
     # ===== ゲーム基本 =====
-    "game_time_sec": 100,
+    "game_time_sec": 1000,
     "spawn_interval": 0.8,
     "max_balloons": 12,
 
@@ -54,7 +54,7 @@ CONFIG = {
 
     # ===== シリアル =====
     "use_serial": True,
-    "serial_port": "COM9",
+    "serial_port": "COM10",
     "baudrate": 115200,
     "shot_cooldown_sec": 0.15,
 
