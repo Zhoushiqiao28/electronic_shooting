@@ -47,6 +47,8 @@ CONFIG = {
 
     # ===== カメラ =====
     "camera_index": 0,
+    "camera_w": 1280,
+    "camera_h": 720,
     "show_camera_window": False,
     "show_threshold_window": False,
     "show_tracking_window": True,
@@ -75,6 +77,13 @@ CONFIG = {
     "balloon_bomb_color": (60, 60, 60),
     "balloon_string_color": (220, 220, 220),
 
+    # ===== 破裂エフェクト =====
+    "pop_effect_duration_sec": 0.28,
+    "pop_particle_count": 12,
+    "pop_particle_speed_min": 140,
+    "pop_particle_speed_max": 280,
+    "pop_particle_gravity": 420,
+
     # ===== UI =====
     "bg_color": (20, 20, 35),
     "text_color": (255, 255, 255),
@@ -82,6 +91,8 @@ CONFIG = {
     # ===== 投影補正 =====
     # カメラ画像上のスクリーン4点
     # 左上, 右上, 右下, 左下
+    "cam_points_ref_w": 1280,
+    "cam_points_ref_h": 720,
     "cam_points": [
         [100, 100],
         [1180, 90],

@@ -33,10 +33,59 @@ class Balloon:
         return 0
 
 
+@dataclass
+class PopParticle:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    radius: float
+    color: tuple
+    life: float
+
+    def update(self, dt):
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self.vy += CONFIG["pop_particle_gravity"] * dt
+        self.life -= dt
+
+
+@dataclass
+class PopBurst:
+    x: float
+    y: float
+    radius: float
+    color: tuple
+    life: float
+    max_life: float
+    particles: list
+
+    def update(self, dt):
+        self.life -= dt
+
+        for particle in self.particles:
+            particle.update(dt)
+
+        self.particles = [particle for particle in self.particles if particle.life > 0]
+
+    def alive(self):
+        return self.life > 0 or bool(self.particles)
+
+
 class LaserTracker:
     def __init__(self):
         self.cap = cv2.VideoCapture(CONFIG["camera_index"])
-        self.cam_points = np.array(CONFIG["cam_points"], dtype=np.float32)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG.get("camera_w", 1280))
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG.get("camera_h", 720))
+        self.frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or CONFIG.get(
+            "camera_w",
+            1280,
+        )
+        self.frame_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or CONFIG.get(
+            "camera_h",
+            720,
+        )
+        self.cam_points = self.scale_cam_points()
         self.last_camera_point = None
         self.feedback_text = ""
         self.feedback_color = (255, 255, 255)
@@ -54,6 +103,19 @@ class LaserTracker:
         )
 
         self.h_matrix = cv2.getPerspectiveTransform(self.cam_points, screen_points)
+
+    def scale_cam_points(self):
+        cam_points = np.array(CONFIG["cam_points"], dtype=np.float32)
+        ref_w = CONFIG.get("cam_points_ref_w", self.frame_w)
+        ref_h = CONFIG.get("cam_points_ref_h", self.frame_h)
+
+        if ref_w <= 0 or ref_h <= 0:
+            return cam_points
+
+        scaled = cam_points.copy()
+        scaled[:, 0] *= self.frame_w / ref_w
+        scaled[:, 1] *= self.frame_h / ref_h
+        return scaled
 
     def draw_calibration_overlay(self, image):
         if not CONFIG.get("show_calibration_overlay", False):
@@ -80,6 +142,16 @@ class LaserTracker:
             overlay,
             "Adjust camera and cam_points with this frame",
             (20, image.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 200, 0),
+            2,
+        )
+
+        cv2.putText(
+            overlay,
+            f"frame: {self.frame_w}x{self.frame_h}",
+            (20, image.shape[0] - 50),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 200, 0),
@@ -366,6 +438,7 @@ class Game:
         self.receiver = ShotReceiver()
 
         self.balloons = []
+        self.pop_bursts = []
         self.score = 0
         self.combo = 0
         self.shot_count = 0
@@ -423,6 +496,47 @@ class Game:
             Balloon(x, y, radius, speed, kind)
         )
 
+    def balloon_color(self, kind):
+        if kind == "normal":
+            return CONFIG["balloon_normal_color"]
+        if kind == "bonus":
+            return CONFIG["balloon_bonus_color"]
+        return CONFIG["balloon_bomb_color"]
+
+    def spawn_pop_burst(self, balloon):
+        particles = []
+        duration = CONFIG["pop_effect_duration_sec"]
+
+        for _ in range(CONFIG["pop_particle_count"]):
+            angle = random.uniform(0, 2 * np.pi)
+            speed = random.uniform(
+                CONFIG["pop_particle_speed_min"],
+                CONFIG["pop_particle_speed_max"],
+            )
+            particles.append(
+                PopParticle(
+                    x=balloon.x,
+                    y=balloon.y,
+                    vx=np.cos(angle) * speed,
+                    vy=np.sin(angle) * speed,
+                    radius=random.uniform(3, 7),
+                    color=self.balloon_color(balloon.kind),
+                    life=duration,
+                )
+            )
+
+        self.pop_bursts.append(
+            PopBurst(
+                x=balloon.x,
+                y=balloon.y,
+                radius=balloon.radius,
+                color=self.balloon_color(balloon.kind),
+                life=duration,
+                max_life=duration,
+                particles=particles,
+            )
+        )
+
     def multiplier(self):
         if self.combo >= CONFIG["combo_x3_count"]:
             return CONFIG["combo_x3_multiplier"]
@@ -454,6 +568,7 @@ class Game:
             if dx * dx + dy * dy <= balloon.radius * balloon.radius:
 
                 balloon.alive = False
+                self.spawn_pop_burst(balloon)
 
                 gained = balloon.score()
 
@@ -487,7 +602,11 @@ class Game:
         for b in self.balloons:
             b.update(dt)
 
+        for burst in self.pop_bursts:
+            burst.update(dt)
+
         self.balloons = [b for b in self.balloons if b.alive]
+        self.pop_bursts = [burst for burst in self.pop_bursts if burst.alive()]
 
         self.laser = self.tracker.read()
 
@@ -497,13 +616,7 @@ class Game:
             self.tracker.set_shot_feedback(self.last_shot_hit)
 
     def draw_balloon(self, b):
-
-        if b.kind == "normal":
-            color = CONFIG["balloon_normal_color"]
-        elif b.kind == "bonus":
-            color = CONFIG["balloon_bonus_color"]
-        else:
-            color = CONFIG["balloon_bomb_color"]
+        color = self.balloon_color(b.kind)
 
         pygame.draw.circle(
             self.screen,
@@ -519,6 +632,38 @@ class Game:
             (int(b.x), int(b.y + b.radius + 30)),
             2,
         )
+
+    def draw_pop_burst(self, burst):
+        progress = 1 - max(0, burst.life) / burst.max_life
+        ring_radius = int(burst.radius * (0.6 + progress * 1.2))
+        ring_width = max(1, int(6 * (1 - progress)))
+
+        pygame.draw.circle(
+            self.screen,
+            burst.color,
+            (int(burst.x), int(burst.y)),
+            max(1, ring_radius),
+            ring_width,
+        )
+
+        flash_radius = max(2, int(burst.radius * (1 - progress * 0.7)))
+        pygame.draw.circle(
+            self.screen,
+            (255, 255, 255),
+            (int(burst.x), int(burst.y)),
+            flash_radius,
+            1,
+        )
+
+        for particle in burst.particles:
+            particle_progress = max(0.15, particle.life / burst.max_life)
+            particle_radius = max(1, int(particle.radius * particle_progress))
+            pygame.draw.circle(
+                self.screen,
+                particle.color,
+                (int(particle.x), int(particle.y)),
+                particle_radius,
+            )
 
     def draw_shot_marker(self):
 
@@ -568,6 +713,9 @@ class Game:
 
         for b in self.balloons:
             self.draw_balloon(b)
+
+        for burst in self.pop_bursts:
+            self.draw_pop_burst(burst)
 
         if self.laser is not None:
 
