@@ -13,11 +13,11 @@ CONFIG = {
 
     # ===== 風船サイズ =====
     "balloon_radius_min": 25,
-    "balloon_radius_max": 45,
+    "balloon_radius_max": 50,
 
     # ===== 風船速度 =====
-    "balloon_speed_min": 120,
-    "balloon_speed_max": 220,
+    "balloon_speed_min": 100,
+    "balloon_speed_max": 300,
 
     # ===== スポーン位置 =====
     "spawn_x_margin": 80,
@@ -32,7 +32,7 @@ CONFIG = {
     # ===== 得点 =====
     "score_normal": 10,
     "score_bonus": 30,
-    "score_bomb": -20,
+    "score_bomb": -10,
 
     # ===== コンボ =====
     "combo_x2_count": 5,
