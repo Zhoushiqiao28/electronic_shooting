@@ -74,9 +74,14 @@ class PopBurst:
 
 class LaserTracker:
     def __init__(self):
-        self.cap = cv2.VideoCapture(CONFIG["camera_index"])
+        self.cap = self.open_camera()
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CONFIG.get("camera_buffer_size", 1))
+        except Exception:
+            pass
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG.get("camera_w", 1280))
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG.get("camera_h", 720))
+        self.apply_camera_settings()
         self.frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or CONFIG.get(
             "camera_w",
             1280,
@@ -91,6 +96,16 @@ class LaserTracker:
         self.feedback_color = (255, 255, 255)
         self.feedback_until = 0
         self.feedback_camera_point = None
+        self.screen_offset_x = CONFIG.get("laser_screen_offset_x", 0)
+        self.screen_offset_y = CONFIG.get("laser_screen_offset_y", 0)
+        self.last_screen_point = None
+        self.last_detected_at = 0.0
+        self.smoothed_screen_point = None
+        self.selected_cam_point_index = 0
+        self.calibration_mode = False
+        self.last_frame = None
+        self.auto_quad_points = None
+        self.bg_response_model = None
 
         screen_points = np.array(
             [
@@ -101,8 +116,119 @@ class LaserTracker:
             ],
             dtype=np.float32,
         )
+        self.screen_points = screen_points
 
-        self.h_matrix = cv2.getPerspectiveTransform(self.cam_points, screen_points)
+        self.update_h_matrix()
+
+    def apply_camera_settings(self):
+        camera_settings = [
+            (cv2.CAP_PROP_AUTO_EXPOSURE, CONFIG.get("camera_auto_exposure")),
+            (cv2.CAP_PROP_EXPOSURE, CONFIG.get("camera_exposure")),
+            (cv2.CAP_PROP_GAIN, CONFIG.get("camera_gain")),
+            (cv2.CAP_PROP_BRIGHTNESS, CONFIG.get("camera_brightness")),
+        ]
+
+        for prop_id, value in camera_settings:
+            if value is None:
+                continue
+            try:
+                self.cap.set(prop_id, value)
+            except Exception:
+                pass
+
+        print(
+            "Camera settings:",
+            {
+                "auto_exposure": self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE),
+                "exposure": self.cap.get(cv2.CAP_PROP_EXPOSURE),
+                "gain": self.cap.get(cv2.CAP_PROP_GAIN),
+                "brightness": self.cap.get(cv2.CAP_PROP_BRIGHTNESS),
+            },
+        )
+
+    def update_h_matrix(self):
+        self.h_matrix = cv2.getPerspectiveTransform(self.cam_points, self.screen_points)
+        self.update_detection_roi()
+
+    def update_detection_roi(self):
+        points = self.cam_points.astype(np.int32)
+        x, y, w, h = cv2.boundingRect(points)
+        self.roi_x = x
+        self.roi_y = y
+        self.roi_w = max(1, w)
+        self.roi_h = max(1, h)
+
+        local_points = self.cam_points.copy()
+        local_points[:, 0] -= self.roi_x
+        local_points[:, 1] -= self.roi_y
+        self.roi_points = local_points
+        self.roi_mask = np.zeros((self.roi_h, self.roi_w), dtype=np.uint8)
+        cv2.fillConvexPoly(
+            self.roi_mask,
+            self.roi_points.astype(np.int32),
+            255,
+        )
+        self.bg_response_model = None
+
+    def order_points(self, points):
+        points = np.array(points, dtype=np.float32)
+        sums = points.sum(axis=1)
+        diffs = np.diff(points, axis=1).reshape(-1)
+        ordered = np.zeros((4, 2), dtype=np.float32)
+        ordered[0] = points[np.argmin(sums)]
+        ordered[2] = points[np.argmax(sums)]
+        ordered[1] = points[np.argmin(diffs)]
+        ordered[3] = points[np.argmax(diffs)]
+        return ordered
+
+    def backend_id(self, name):
+        if name == "dshow":
+            return cv2.CAP_DSHOW
+        if name == "msmf":
+            return cv2.CAP_MSMF
+        if name == "any":
+            return cv2.CAP_ANY
+        return cv2.CAP_ANY
+
+    def open_camera(self):
+        backend_name = str(CONFIG.get("camera_backend", "any")).lower()
+        if backend_name == "any":
+            backends = ["any", "dshow", "msmf"]
+        elif backend_name == "dshow":
+            backends = ["dshow", "any", "msmf"]
+        elif backend_name == "msmf":
+            backends = ["msmf", "any", "dshow"]
+        else:
+            backends = ["any", "dshow", "msmf"]
+
+        indices = [CONFIG.get("camera_index", 0)]
+
+        for index in CONFIG.get("camera_probe_indices", []):
+            if index not in indices:
+                indices.append(index)
+
+        for backend in backends:
+            backend_id = self.backend_id(backend)
+
+            for index in indices:
+                cap = cv2.VideoCapture(index, backend_id)
+                if cap.isOpened():
+                    ok = False
+
+                    for _ in range(15):
+                        ok, _ = cap.read()
+                        if ok:
+                            break
+                        time.sleep(0.03)
+
+                    if ok:
+                        print(f"Camera opened: index={index}, backend={backend}")
+                        return cap
+                cap.release()
+
+        raise RuntimeError(
+            f"Camera open failed. Tried indices={indices} backends={backends}"
+        )
 
     def scale_cam_points(self):
         cam_points = np.array(CONFIG["cam_points"], dtype=np.float32)
@@ -126,24 +252,30 @@ class LaserTracker:
 
         cv2.polylines(overlay, [points], True, (255, 200, 0), 2)
 
+        if self.auto_quad_points is not None:
+            auto_points = self.auto_quad_points.astype(np.int32)
+            cv2.polylines(overlay, [auto_points], True, (255, 0, 180), 2)
+
         for index, (x, y) in enumerate(points):
-            cv2.circle(overlay, (x, y), 6, (0, 200, 255), -1)
+            point_color = (0, 255, 120) if index == self.selected_cam_point_index else (0, 200, 255)
+            point_radius = 8 if index == self.selected_cam_point_index else 6
+            cv2.circle(overlay, (x, y), point_radius, point_color, -1)
             cv2.putText(
                 overlay,
                 f"P{index + 1} ({x}, {y})",
                 (x + 8, max(20, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (0, 200, 255),
+                point_color,
                 2,
             )
 
         cv2.putText(
             overlay,
-            "Adjust camera and cam_points with this frame",
+            "C: calib  Tab: next  Arrow: move  A: auto  Ctrl+S: save",
             (20, image.shape[0] - 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            0.52,
             (255, 200, 0),
             2,
         )
@@ -158,7 +290,345 @@ class LaserTracker:
             2,
         )
 
+        cv2.putText(
+            overlay,
+            f"calibration: {'ON' if self.calibration_mode else 'OFF'}",
+            (20, image.shape[0] - 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 120) if self.calibration_mode else (180, 180, 180),
+            2,
+        )
+
         return overlay
+
+    def toggle_calibration_mode(self):
+        self.calibration_mode = not self.calibration_mode
+        print("Calibration mode:", "ON" if self.calibration_mode else "OFF")
+
+    def select_cam_point(self, index):
+        if 0 <= index < len(self.cam_points):
+            self.selected_cam_point_index = index
+            print(f"Selected cam point: P{index + 1}")
+
+    def select_next_cam_point(self):
+        self.selected_cam_point_index = (
+            self.selected_cam_point_index + 1
+        ) % len(self.cam_points)
+        print(f"Selected cam point: P{self.selected_cam_point_index + 1}")
+
+    def move_selected_cam_point(self, dx, dy):
+        point = self.cam_points[self.selected_cam_point_index]
+        point[0] = np.clip(point[0] + dx, 0, self.frame_w - 1)
+        point[1] = np.clip(point[1] + dy, 0, self.frame_h - 1)
+        self.update_h_matrix()
+        print(
+            f"P{self.selected_cam_point_index + 1} = "
+            f"({int(point[0])}, {int(point[1])})"
+        )
+
+    def cam_points_for_config(self):
+        ref_w = CONFIG.get("cam_points_ref_w", self.frame_w)
+        ref_h = CONFIG.get("cam_points_ref_h", self.frame_h)
+        export_points = self.cam_points.copy()
+
+        if self.frame_w > 0 and self.frame_h > 0:
+            export_points[:, 0] *= ref_w / self.frame_w
+            export_points[:, 1] *= ref_h / self.frame_h
+
+        return [[int(round(x)), int(round(y))] for x, y in export_points]
+
+    def save_calibration_to_config(self, config_path="config.py"):
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        new_points_block = "    \"cam_points\": [\n"
+        for x, y in self.cam_points_for_config():
+            new_points_block += f"        [{x}, {y}],\n"
+        new_points_block += "    ],"
+
+        import re
+
+        content, count = re.subn(
+            r'    "cam_points": \[\n(?:        \[[^\n]+\],\n)+    \],',
+            new_points_block,
+            content,
+        )
+
+        if count != 1:
+            raise RuntimeError("Failed to update cam_points in config.py")
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        print("Saved tracker settings to config.py")
+
+    def detect_auto_quad(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        edges = cv2.Canny(
+            blurred,
+            CONFIG.get("auto_calibration_canny_low", 40),
+            CONFIG.get("auto_calibration_canny_high", 120),
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(
+            edges,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        best_quad = None
+        best_area = 0
+        min_area = (
+            self.frame_w
+            * self.frame_h
+            * CONFIG.get("auto_calibration_min_area_ratio", 0.12)
+        )
+        epsilon_ratio = CONFIG.get("auto_calibration_epsilon_ratio", 0.03)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+
+            perimeter = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, perimeter * epsilon_ratio, True)
+
+            if len(approx) == 4 and area > best_area:
+                best_area = area
+                best_quad = self.order_points(approx.reshape(4, 2))
+
+        if best_quad is None and contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) >= min_area:
+                rect = cv2.minAreaRect(largest)
+                best_quad = self.order_points(cv2.boxPoints(rect))
+
+        self.auto_quad_points = best_quad
+        return best_quad
+
+    def auto_calibrate(self):
+        if self.last_frame is None:
+            print("Auto calibration skipped: no camera frame yet")
+            return False
+
+        quad = self.detect_auto_quad(self.last_frame)
+        if quad is None:
+            print("Auto calibration failed: no screen edge quad found")
+            return False
+
+        self.cam_points = quad.astype(np.float32)
+        self.update_h_matrix()
+        print("Auto calibration applied:", self.cam_points_for_config())
+        return True
+
+    def build_laser_mask(self, frame):
+        roi = frame[
+            self.roi_y : self.roi_y + self.roi_h,
+            self.roi_x : self.roi_x + self.roi_w,
+        ]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        bgr_int = roi.astype(np.int16)
+        blue = bgr_int[:, :, 0]
+        green = bgr_int[:, :, 1]
+        red = bgr_int[:, :, 2]
+        red_margin = CONFIG.get("laser_red_margin", 30)
+        red_min = CONFIG.get("laser_r_min", 90)
+
+        red_excess = np.clip(red - np.maximum(green, blue), 0, 255).astype(np.uint8)
+        dominant_score = np.clip(red * 2 - green - blue, 0, 255).astype(np.uint8)
+        bright_score = gray.astype(np.uint8)
+
+        bias_kernel = int(CONFIG.get("laser_column_bias_kernel", 81))
+        if bias_kernel % 2 == 0:
+            bias_kernel += 1
+        bias_gain = float(CONFIG.get("laser_column_bias_gain", 0.8))
+        column_profile = bright_score.mean(axis=0, keepdims=True).astype(np.float32)
+        smooth_profile = cv2.GaussianBlur(column_profile, (bias_kernel, 1), 0)
+        column_bias = smooth_profile - smooth_profile.min()
+        bias_image = np.repeat(
+            np.clip(column_bias * bias_gain, 0, 255).astype(np.uint8),
+            bright_score.shape[0],
+            axis=0,
+        )
+        bright_score = cv2.subtract(bright_score, bias_image)
+
+        kernel_size = int(CONFIG.get("laser_local_bg_kernel", 9))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        local_bg = cv2.GaussianBlur(bright_score, (kernel_size, kernel_size), 0)
+        local_peak = cv2.subtract(bright_score, local_bg)
+        raw_gain = float(CONFIG.get("laser_raw_response_gain", 0.55))
+        brightness_gain = float(CONFIG.get("laser_brightness_gain", 1.0))
+        red_gain = float(CONFIG.get("laser_red_response_gain", 1.0))
+        boosted_raw = np.clip(bright_score.astype(np.float32) * brightness_gain, 0, 255).astype(
+            np.uint8
+        )
+        red_bg = cv2.GaussianBlur(dominant_score, (kernel_size, kernel_size), 0)
+        red_local_peak = cv2.subtract(dominant_score, red_bg)
+        boosted_red = np.clip(dominant_score.astype(np.float32) * red_gain, 0, 255).astype(
+            np.uint8
+        )
+
+        dominance_mask = (
+            (red >= red_min)
+            & (red - green >= red_margin)
+            & (red - blue >= red_margin)
+        ).astype(np.uint8) * 255
+
+        bright_mask = (bright_score >= CONFIG.get("laser_v_min", 90)).astype(np.uint8) * 255
+
+        valid_mask = cv2.bitwise_and(
+            cv2.bitwise_or(bright_mask, dominance_mask),
+            self.roi_mask,
+        )
+
+        left_ignore = int(CONFIG.get("laser_ignore_left_px", 0))
+        right_ignore = int(CONFIG.get("laser_ignore_right_px", 0))
+        top_ignore = int(CONFIG.get("laser_ignore_top_px", 0))
+        bottom_ignore = int(CONFIG.get("laser_ignore_bottom_px", 0))
+
+        if left_ignore > 0:
+            valid_mask[:, : min(left_ignore, self.roi_w)] = 0
+        if right_ignore > 0:
+            valid_mask[:, max(0, self.roi_w - right_ignore) :] = 0
+        if top_ignore > 0:
+            valid_mask[: min(top_ignore, self.roi_h), :] = 0
+        if bottom_ignore > 0:
+            valid_mask[max(0, self.roi_h - bottom_ignore) :, :] = 0
+
+        if self.bg_response_model is None or self.bg_response_model.shape != bright_score.shape:
+            self.bg_response_model = bright_score.astype(np.float32)
+
+        bg_alpha = float(CONFIG.get("laser_bg_alpha", 0.04))
+        temporal_gain = float(CONFIG.get("laser_temporal_gain", 0.65))
+        temporal_delta = cv2.subtract(
+            bright_score,
+            self.bg_response_model.astype(np.uint8),
+        )
+        temporal_boost = np.clip(
+            temporal_delta.astype(np.float32) * temporal_gain,
+            0,
+            255,
+        ).astype(np.uint8)
+
+        response = cv2.max(local_peak, boosted_raw)
+        response = cv2.max(response, temporal_boost)
+        response = cv2.max(response, red_local_peak)
+        response = cv2.max(response, boosted_red)
+        response = cv2.max(
+            response,
+            np.clip(dominant_score.astype(np.float32) * raw_gain, 0, 255).astype(np.uint8),
+        )
+        response = cv2.GaussianBlur(response, (3, 3), 0)
+        response = cv2.bitwise_and(response, valid_mask)
+
+        masked_bright = bright_score.astype(np.float32)
+        masked_bright[valid_mask == 0] = 0
+        self.bg_response_model = (
+            self.bg_response_model * (1.0 - bg_alpha)
+            + masked_bright * bg_alpha
+        )
+
+        mask = valid_mask
+
+        full_mask = np.zeros((self.frame_h, self.frame_w), dtype=np.uint8)
+        full_mask[
+            self.roi_y : self.roi_y + self.roi_h,
+            self.roi_x : self.roi_x + self.roi_w,
+        ] = mask
+
+        return full_mask, response
+
+    def detect_best_laser_point(self, mask, response):
+        local_mask = mask[
+            self.roi_y : self.roi_y + self.roi_h,
+            self.roi_x : self.roi_x + self.roi_w,
+        ]
+        response_min = CONFIG.get("laser_response_min", 10)
+        _, peak_score, _, peak_loc = cv2.minMaxLoc(response, mask=local_mask)
+        candidate_score = peak_score
+        candidate_loc = peak_loc
+
+        if self.last_camera_point is not None:
+            search_radius = int(CONFIG.get("laser_tracking_search_radius", 90))
+            min_ratio = float(CONFIG.get("laser_tracking_min_score_ratio", 0.6))
+            relaxed_min = float(CONFIG.get("laser_tracking_relaxed_min", 3))
+            prev_x = int(self.last_camera_point[0] - self.roi_x)
+            prev_y = int(self.last_camera_point[1] - self.roi_y)
+
+            search_mask = np.zeros_like(local_mask)
+            cv2.circle(search_mask, (prev_x, prev_y), search_radius, 255, -1)
+            local_search_mask = cv2.bitwise_and(local_mask, search_mask)
+            _, local_score, _, local_loc = cv2.minMaxLoc(response, mask=local_search_mask)
+
+            if local_score >= response_min * min_ratio:
+                candidate_score = local_score
+                candidate_loc = local_loc
+            elif candidate_score < response_min and local_score >= relaxed_min:
+                candidate_score = local_score
+                candidate_loc = local_loc
+
+        if candidate_score < response_min:
+            return None, candidate_score
+
+        px, py = candidate_loc
+        radius = int(CONFIG.get("laser_peak_window_radius", 4))
+        x0 = max(0, px - radius)
+        y0 = max(0, py - radius)
+        x1 = min(self.roi_w, px + radius + 1)
+        y1 = min(self.roi_h, py + radius + 1)
+
+        patch_response = response[y0:y1, x0:x1].astype(np.float32)
+        patch_mask = local_mask[y0:y1, x0:x1] > 0
+        relative_threshold = candidate_score * float(
+            CONFIG.get("laser_peak_relative_threshold", 0.45)
+        )
+        strong_patch = patch_response >= relative_threshold
+        weights = np.where(patch_mask & strong_patch, patch_response, 0.0)
+        total = float(weights.sum())
+
+        if total > 0:
+            xs = np.arange(x0, x1, dtype=np.float32)
+            ys = np.arange(y0, y1, dtype=np.float32)
+            grid_x, grid_y = np.meshgrid(xs, ys)
+            cx = float((weights * grid_x).sum() / total)
+            cy = float((weights * grid_y).sum() / total)
+        else:
+            cx = float(px)
+            cy = float(py)
+
+        return (self.roi_x + cx, self.roi_y + cy), candidate_score
+
+    def apply_screen_offset(self, sx, sy):
+        sx += self.screen_offset_x
+        sy += self.screen_offset_y
+        sx = float(np.clip(sx, 0, CONFIG["screen_w"] - 1))
+        sy = float(np.clip(sy, 0, CONFIG["screen_h"] - 1))
+        return sx, sy
+
+    def adjust_screen_offset(self, dx, dy):
+        self.screen_offset_x += dx
+        self.screen_offset_y += dy
+        print(
+            "Laser screen offset:",
+            f"x={self.screen_offset_x}",
+            f"y={self.screen_offset_y}",
+        )
+
+    def debug_lines(self):
+        return [
+            f"Aim offset: x={self.screen_offset_x} y={self.screen_offset_y}",
+            "Ctrl+Arrow: adjust aim",
+            f"Cam point: P{self.selected_cam_point_index + 1}",
+            f"Calibration mode: {'ON' if self.calibration_mode else 'OFF'}",
+            "C calib  Tab next  Arrow move  A auto  Ctrl+S save",
+        ]
 
     def set_shot_feedback(self, hit):
         self.feedback_text = "HIT" if hit else "NO HIT"
@@ -168,34 +638,22 @@ class LaserTracker:
         self.feedback_until = time.time() + CONFIG["camera_feedback_duration_sec"]
         self.feedback_camera_point = self.last_camera_point
 
-    def read(self):
+    def read_frame(self):
         ok, frame = self.cap.read()
         if not ok:
-            return None
+            return None, None
+        return frame, time.time()
+
+    def process_frame(self, frame, frame_time=None, use_smoothing=True):
+        if frame_time is None:
+            frame_time = time.time()
+
+        self.last_frame = frame.copy()
 
         camera_view = self.draw_calibration_overlay(frame.copy())
         tracking_view = camera_view.copy()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        _, thresh = cv2.threshold(
-            gray,
-            CONFIG["laser_threshold"],
-            255,
-            cv2.THRESH_BINARY,
-        )
-
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh)
-
-        best = None
-        best_area = 0
-
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-
-            if CONFIG["laser_min_area"] <= area <= CONFIG["laser_max_area"]:
-                if area > best_area:
-                    best_area = area
-                    best = centroids[i]
+        thresh, response = self.build_laser_mask(frame)
+        best, best_score = self.detect_best_laser_point(thresh, response)
 
         screen_point = None
         self.last_camera_point = None
@@ -206,7 +664,23 @@ class LaserTracker:
             src = np.array([[[cx, cy]]], dtype=np.float32)
             dst = cv2.perspectiveTransform(src, self.h_matrix)
             sx, sy = dst[0][0]
-            screen_point = (sx, sy)
+            sx, sy = self.apply_screen_offset(sx, sy)
+            if use_smoothing:
+                smoothing = float(CONFIG.get("laser_screen_smoothing", 0.35))
+                if self.smoothed_screen_point is None:
+                    self.smoothed_screen_point = (sx, sy)
+                else:
+                    prev_x, prev_y = self.smoothed_screen_point
+                    self.smoothed_screen_point = (
+                        prev_x * (1.0 - smoothing) + sx * smoothing,
+                        prev_y * (1.0 - smoothing) + sy * smoothing,
+                    )
+                screen_point = self.smoothed_screen_point
+            else:
+                screen_point = (sx, sy)
+                self.smoothed_screen_point = screen_point
+            self.last_screen_point = screen_point
+            self.last_detected_at = frame_time
 
             cv2.circle(camera_view, (int(cx), int(cy)), 10, (0, 255, 0), 2)
             cv2.putText(
@@ -232,7 +706,7 @@ class LaserTracker:
 
             cv2.putText(
                 tracking_view,
-                f"screen: ({int(sx)}, {int(sy)})",
+                f"screen: ({int(sx)}, {int(sy)}) score:{int(best_score)}",
                 (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -241,6 +715,14 @@ class LaserTracker:
             )
 
         else:
+            if (
+                self.last_screen_point is not None
+                and frame_time - self.last_detected_at <= CONFIG.get("laser_hold_sec", 0.08)
+            ):
+                screen_point = self.last_screen_point
+            else:
+                self.smoothed_screen_point = None
+
             cv2.putText(
                 tracking_view,
                 "laser: not found",
@@ -250,6 +732,16 @@ class LaserTracker:
                 (0, 0, 255),
                 2,
             )
+
+        cv2.putText(
+            tracking_view,
+            f"offset: ({self.screen_offset_x}, {self.screen_offset_y})",
+            (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (80, 200, 255),
+            2,
+        )
 
         if time.time() < self.feedback_until:
             cv2.putText(
@@ -297,10 +789,37 @@ class LaserTracker:
             cv2.waitKey(1)
 
         if CONFIG.get("show_tracking_window", False):
+            tracking_scale = float(CONFIG.get("tracking_window_scale", 1.0))
+            tracking_w = max(320, int(self.frame_w * tracking_scale))
+            tracking_h = max(180, int(self.frame_h * tracking_scale))
+            cv2.namedWindow("tracking", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("tracking", tracking_w, tracking_h)
             cv2.imshow("tracking", tracking_view)
             cv2.waitKey(1)
 
         return screen_point
+
+    def read(self):
+        frame, frame_time = self.read_frame()
+        if frame is None:
+            return None
+        return self.process_frame(frame, frame_time=frame_time, use_smoothing=True)
+
+    def read_for_shot(self):
+        shot_grabs = max(0, int(CONFIG.get("shot_frame_grabs", 2)))
+
+        for _ in range(shot_grabs):
+            try:
+                if not self.cap.grab():
+                    break
+            except Exception:
+                break
+
+        frame, frame_time = self.read_frame()
+        if frame is None:
+            return self.last_screen_point
+
+        return self.process_frame(frame, frame_time=frame_time, use_smoothing=False)
 
     def release(self):
         self.cap.release()
@@ -416,16 +935,67 @@ class ShotReceiver:
             self.ser = None
 
 
+class SoundManager:
+    def __init__(self):
+        self.enabled = CONFIG.get("enable_sound", True)
+        self.sounds = {}
+
+        if not self.enabled:
+            return
+
+        try:
+            if pygame.mixer.get_init() is None:
+                pygame.mixer.init(frequency=44100, size=-16, channels=1)
+
+            self.sounds = {
+                "hit_normal": self.make_tone(880, 0.08, 0.22),
+                "hit_bonus": self.make_tone(1320, 0.12, 0.26),
+                "hit_bomb": self.make_tone(220, 0.18, 0.28),
+                "miss": self.make_tone(330, 0.09, 0.18),
+                "game_over": self.make_tone(180, 0.35, 0.22),
+            }
+        except pygame.error:
+            self.enabled = False
+
+    def make_tone(self, frequency, duration_sec, volume):
+        mixer_config = pygame.mixer.get_init()
+        sample_rate = mixer_config[0] if mixer_config else 44100
+        channels = mixer_config[2] if mixer_config else 1
+        sample_count = max(1, int(sample_rate * duration_sec))
+        timeline = np.linspace(0, duration_sec, sample_count, False)
+        waveform = np.sin(2 * np.pi * frequency * timeline)
+        envelope = np.linspace(1.0, 0.0, sample_count)
+        audio = waveform * envelope * volume * CONFIG.get("sound_volume", 0.35)
+        audio = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+
+        if channels > 1:
+            audio = np.repeat(audio[:, np.newaxis], channels, axis=1)
+
+        return pygame.sndarray.make_sound(audio)
+
+    def play(self, name):
+        if not self.enabled:
+            return
+
+        sound = self.sounds.get(name)
+        if sound is not None:
+            sound.play()
+
+    def play_hit(self, kind):
+        if kind == "bonus":
+            self.play("hit_bonus")
+        elif kind == "bomb":
+            self.play("hit_bomb")
+        else:
+            self.play("hit_normal")
+
+
 class Game:
     def __init__(self):
         pygame.init()
 
-        flags = pygame.FULLSCREEN if CONFIG["fullscreen"] else 0
-
-        self.screen = pygame.display.set_mode(
-            (CONFIG["screen_w"], CONFIG["screen_h"]),
-            flags,
-        )
+        self.fullscreen = CONFIG["fullscreen"]
+        self.screen = self.create_display()
 
         pygame.display.set_caption(CONFIG["window_title"])
 
@@ -436,6 +1006,7 @@ class Game:
 
         self.tracker = LaserTracker()
         self.receiver = ShotReceiver()
+        self.sound = SoundManager()
 
         self.balloons = []
         self.pop_bursts = []
@@ -454,6 +1025,18 @@ class Game:
         self.last_shot_pos = None
         self.last_shot_hit = False
         self.last_shot_time = 0
+        self.game_over_sound_played = False
+
+    def create_display(self):
+        flags = pygame.FULLSCREEN if self.fullscreen else 0
+        return pygame.display.set_mode(
+            (CONFIG["screen_w"], CONFIG["screen_h"]),
+            flags,
+        )
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self.screen = self.create_display()
 
     def choose_balloon_kind(self):
         r = random.random()
@@ -502,6 +1085,13 @@ class Game:
         if kind == "bonus":
             return CONFIG["balloon_bonus_color"]
         return CONFIG["balloon_bomb_color"]
+
+    def balloon_outline_color(self, kind):
+        if kind == "normal":
+            return CONFIG["balloon_normal_outline_color"]
+        if kind == "bonus":
+            return CONFIG["balloon_bonus_outline_color"]
+        return CONFIG["balloon_bomb_outline_color"]
 
     def spawn_pop_burst(self, balloon):
         particles = []
@@ -553,6 +1143,7 @@ class Game:
 
         if point is None:
             self.combo = 0
+            self.sound.play("miss")
             return
 
         px, py = point
@@ -579,10 +1170,12 @@ class Game:
                     self.combo = 0
                     self.score += gained
 
+                self.sound.play_hit(balloon.kind)
                 self.last_shot_hit = True
                 return
 
         self.combo = 0
+        self.sound.play("miss")
 
     def update(self, dt):
 
@@ -593,6 +1186,9 @@ class Game:
 
         if elapsed >= CONFIG["game_time_sec"]:
             self.game_over = True
+            if not self.game_over_sound_played:
+                self.sound.play("game_over")
+                self.game_over_sound_played = True
             return
 
         if elapsed - self.last_spawn >= CONFIG["spawn_interval"]:
@@ -612,17 +1208,28 @@ class Game:
 
         if self.receiver.poll():
             self.shot_count += 1
-            self.hit_test(self.laser)
+            shot_point = self.tracker.read_for_shot()
+            self.laser = shot_point
+            self.hit_test(shot_point)
             self.tracker.set_shot_feedback(self.last_shot_hit)
 
     def draw_balloon(self, b):
         color = self.balloon_color(b.kind)
+        outline = self.balloon_outline_color(b.kind)
 
         pygame.draw.circle(
             self.screen,
             color,
             (int(b.x), int(b.y)),
             b.radius,
+        )
+
+        pygame.draw.circle(
+            self.screen,
+            outline,
+            (int(b.x), int(b.y)),
+            b.radius,
+            CONFIG["balloon_outline_width"],
         )
 
         pygame.draw.line(
@@ -649,7 +1256,7 @@ class Game:
         flash_radius = max(2, int(burst.radius * (1 - progress * 0.7)))
         pygame.draw.circle(
             self.screen,
-            (255, 255, 255),
+            CONFIG["pop_flash_color"],
             (int(burst.x), int(burst.y)),
             flash_radius,
             1,
@@ -717,7 +1324,7 @@ class Game:
         for burst in self.pop_bursts:
             self.draw_pop_burst(burst)
 
-        if self.laser is not None:
+        if CONFIG.get("show_projected_laser_cursor", False) and self.laser is not None:
 
             lx, ly = self.laser
 
@@ -732,40 +1339,52 @@ class Game:
 
         self.draw_shot_marker()
 
+        projector_dim_alpha = CONFIG.get("projector_dim_alpha", 0)
+        if projector_dim_alpha > 0:
+            dim_overlay = pygame.Surface(
+                (CONFIG["screen_w"], CONFIG["screen_h"]),
+                pygame.SRCALPHA,
+            )
+            dim_overlay.fill((0, 0, 0, projector_dim_alpha))
+            self.screen.blit(dim_overlay, (0, 0))
+
         remain = max(
             0,
             CONFIG["game_time_sec"] - int(time.time() - self.start_time),
         )
 
-        self.screen.blit(
-            self.font.render(f"Score: {self.score}", True, CONFIG["text_color"]),
-            (20, 20),
-        )
-
-        self.screen.blit(
-            self.font.render(f"Combo: {self.combo}", True, CONFIG["text_color"]),
-            (20, 60),
-        )
-
-        self.screen.blit(
-            self.font.render(f"Time: {remain}", True, CONFIG["text_color"]),
-            (20, 100),
-        )
-
-        self.screen.blit(
-            self.font.render(
-                f"Shots: {self.shot_count}",
-                True,
-                CONFIG["text_color"],
-            ),
-            (20, 140),
-        )
-
-        for index, line in enumerate(self.receiver.debug_lines()):
+        if CONFIG.get("show_ui_text", True):
             self.screen.blit(
-                self.small_font.render(line, True, CONFIG["text_color"]),
-                (20, 185 + index * 28),
+                self.font.render(f"Score: {self.score}", True, CONFIG["text_color"]),
+                (20, 20),
             )
+
+            self.screen.blit(
+                self.font.render(f"Combo: {self.combo}", True, CONFIG["text_color"]),
+                (20, 60),
+            )
+
+            self.screen.blit(
+                self.font.render(f"Time: {remain}", True, CONFIG["text_color"]),
+                (20, 100),
+            )
+
+            self.screen.blit(
+                self.font.render(
+                    f"Shots: {self.shot_count}",
+                    True,
+                    CONFIG["text_color"],
+                ),
+                (20, 140),
+            )
+
+            debug_lines = self.receiver.debug_lines() + self.tracker.debug_lines()
+
+            for index, line in enumerate(debug_lines):
+                self.screen.blit(
+                    self.small_font.render(line, True, CONFIG["text_color"]),
+                    (20, 185 + index * 28),
+                )
 
         if self.game_over:
 
@@ -797,8 +1416,52 @@ class Game:
                     self.running = False
 
                 if event.type == pygame.KEYDOWN:
+                    mods = pygame.key.get_mods()
+                    aim_step = 10 if mods & pygame.KMOD_SHIFT else 2
+                    cam_step = (
+                        CONFIG.get("cam_point_step_fast", 10)
+                        if mods & pygame.KMOD_SHIFT
+                        else CONFIG.get("cam_point_step", 2)
+                    )
+
                     if event.key == pygame.K_ESCAPE:
                         self.running = False
+                    if event.key == pygame.K_F11:
+                        self.toggle_fullscreen()
+                    if event.key == pygame.K_c:
+                        self.tracker.toggle_calibration_mode()
+                    if event.key == pygame.K_TAB:
+                        self.tracker.select_next_cam_point()
+                    if event.key == pygame.K_a:
+                        self.tracker.auto_calibrate()
+                    if event.key in (pygame.K_1, pygame.K_KP1):
+                        self.tracker.select_cam_point(0)
+                    if event.key in (pygame.K_2, pygame.K_KP2):
+                        self.tracker.select_cam_point(1)
+                    if event.key in (pygame.K_3, pygame.K_KP3):
+                        self.tracker.select_cam_point(2)
+                    if event.key in (pygame.K_4, pygame.K_KP4):
+                        self.tracker.select_cam_point(3)
+                    if mods & pygame.KMOD_CTRL:
+                        if event.key == pygame.K_LEFT:
+                            self.tracker.adjust_screen_offset(-aim_step, 0)
+                        if event.key == pygame.K_RIGHT:
+                            self.tracker.adjust_screen_offset(aim_step, 0)
+                        if event.key == pygame.K_UP:
+                            self.tracker.adjust_screen_offset(0, -aim_step)
+                        if event.key == pygame.K_DOWN:
+                            self.tracker.adjust_screen_offset(0, aim_step)
+                        if event.key == pygame.K_s:
+                            self.tracker.save_calibration_to_config()
+                    elif self.tracker.calibration_mode:
+                        if event.key == pygame.K_LEFT:
+                            self.tracker.move_selected_cam_point(-cam_step, 0)
+                        if event.key == pygame.K_RIGHT:
+                            self.tracker.move_selected_cam_point(cam_step, 0)
+                        if event.key == pygame.K_UP:
+                            self.tracker.move_selected_cam_point(0, -cam_step)
+                        if event.key == pygame.K_DOWN:
+                            self.tracker.move_selected_cam_point(0, cam_step)
 
             self.update(dt)
             self.draw()
