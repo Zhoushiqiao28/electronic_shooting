@@ -7,7 +7,7 @@ CONFIG = {
     "window_title": "Laser Balloon Game",
 
     # ===== ゲーム基本 =====
-    "game_time_sec": 500,
+    "game_time_sec": 20,
     "spawn_interval": 0.8,
     "max_balloons": 12,
 
@@ -30,9 +30,9 @@ CONFIG = {
     "spawn_rate_bomb": 0.07,
 
     # ===== 得点 =====
-    "score_normal": 10,
-    "score_bonus": 30,
-    "score_bomb": -10,
+    "score_normal": 30,
+    "score_bonus": 40,
+    "score_bomb": 50,
 
     # ===== コンボ =====
     "combo_x2_count": 5,
@@ -95,7 +95,7 @@ CONFIG = {
     "shot_cooldown_sec": 0.15,
 
     # ===== ショット表示 =====
-    "show_shot_marker": True,
+    "show_shot_marker": False,
     "shot_marker_duration_sec": 0.2,
     "camera_feedback_duration_sec": 0.8,
     "shot_marker_radius": 18,
@@ -128,9 +128,28 @@ CONFIG = {
 
     # ===== UI =====
     "bg_color": (7, 10, 18),
-    "text_color": (165, 190, 215),
-    "show_ui_text": False,
+    "text_color": (115, 130, 145),
+    "show_ui_text": True,
     "projector_dim_alpha": 120,
+    "ui_panel_x": 16,
+    "ui_panel_y": 16,
+    "ui_panel_width": 220,
+    "ui_panel_height": 118,
+    "ui_panel_color": (6, 10, 16, 145),
+    "ui_line_gap": 34,
+    "ui_text_color": (108, 124, 138),
+    "ui_shot_on_color": (118, 132, 145),
+    "ui_shot_off_color": (78, 92, 104),
+    "shot_status_duration_sec": 0.18,
+    "action_button_width": 260,
+    "action_button_height": 160,
+    "action_button_color": (8, 12, 18, 185),
+    "action_button_outline_color": (72, 88, 102),
+    "action_icon_color": (128, 144, 156),
+    "action_label_color": (112, 128, 140),
+    "score_title_color": (52, 62, 72),
+    "score_subtitle_color": (64, 76, 88),
+    "score_value_color": (110, 124, 136),
 
     # ===== 投影補正 =====
     # カメラ画像上のスクリーン4点

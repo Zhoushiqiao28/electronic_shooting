@@ -1003,6 +1003,7 @@ class Game:
         self.font = pygame.font.SysFont(None, 40)
         self.small_font = pygame.font.SysFont(None, 28)
         self.big_font = pygame.font.SysFont(None, 70)
+        self.huge_font = pygame.font.SysFont(None, 150)
 
         self.tracker = LaserTracker()
         self.receiver = ShotReceiver()
@@ -1018,7 +1019,8 @@ class Game:
         self.last_spawn = 0
 
         self.running = True
-        self.game_over = False
+        self.state = "start"
+        self.final_score = 0
 
         self.laser = None
 
@@ -1026,6 +1028,7 @@ class Game:
         self.last_shot_hit = False
         self.last_shot_time = 0
         self.game_over_sound_played = False
+        self.action_buttons = self.build_action_buttons()
 
     def create_display(self):
         flags = pygame.FULLSCREEN if self.fullscreen else 0
@@ -1037,6 +1040,90 @@ class Game:
     def toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
         self.screen = self.create_display()
+        self.action_buttons = self.build_action_buttons()
+
+    def build_action_buttons(self):
+        center_x = CONFIG["screen_w"] // 2
+        center_y = CONFIG["screen_h"] // 2
+        button_w = CONFIG.get("action_button_width", 260)
+        button_h = CONFIG.get("action_button_height", 160)
+
+        def make_rect(offset_y):
+            return pygame.Rect(
+                center_x - button_w // 2,
+                center_y + offset_y - button_h // 2,
+                button_w,
+                button_h,
+            )
+
+        return {
+            "start": make_rect(40),
+            "score": make_rect(80),
+            "home": make_rect(150),
+        }
+
+    def reset_round(self):
+        self.balloons = []
+        self.pop_bursts = []
+        self.score = 0
+        self.combo = 0
+        self.shot_count = 0
+        self.start_time = time.time()
+        self.last_spawn = 0
+        self.last_shot_pos = None
+        self.last_shot_hit = False
+        self.last_shot_time = 0
+        self.game_over_sound_played = False
+
+    def start_round(self):
+        self.reset_round()
+        self.final_score = 0
+        self.state = "play"
+
+    def finish_round(self):
+        self.final_score = self.score
+        self.balloons = []
+        self.pop_bursts = []
+        self.combo = 0
+        self.state = "score_prompt"
+        if not self.game_over_sound_played:
+            self.sound.play("game_over")
+            self.game_over_sound_played = True
+
+    def return_to_start(self):
+        self.balloons = []
+        self.pop_bursts = []
+        self.combo = 0
+        self.last_shot_pos = None
+        self.last_shot_hit = False
+        self.state = "start"
+
+    def point_hits_button(self, point, button_key):
+        if point is None:
+            return False
+        return self.action_buttons[button_key].collidepoint(int(point[0]), int(point[1]))
+
+    def handle_menu_shot(self, point):
+        self.last_shot_pos = point
+        self.last_shot_hit = False
+        self.last_shot_time = time.time()
+
+        if self.state == "start" and self.point_hits_button(point, "start"):
+            self.last_shot_hit = True
+            self.start_round()
+            return True
+
+        if self.state == "score_prompt" and self.point_hits_button(point, "score"):
+            self.last_shot_hit = True
+            self.state = "score_view"
+            return True
+
+        if self.state == "score_view" and self.point_hits_button(point, "home"):
+            self.last_shot_hit = True
+            self.return_to_start()
+            return True
+
+        return False
 
     def choose_balloon_kind(self):
         r = random.random()
@@ -1177,18 +1264,12 @@ class Game:
         self.combo = 0
         self.sound.play("miss")
 
-    def update(self, dt):
-
-        if self.game_over:
-            return
+    def update_play(self, dt):
 
         elapsed = time.time() - self.start_time
 
         if elapsed >= CONFIG["game_time_sec"]:
-            self.game_over = True
-            if not self.game_over_sound_played:
-                self.sound.play("game_over")
-                self.game_over_sound_played = True
+            self.finish_round()
             return
 
         if elapsed - self.last_spawn >= CONFIG["spawn_interval"]:
@@ -1204,14 +1285,28 @@ class Game:
         self.balloons = [b for b in self.balloons if b.alive]
         self.pop_bursts = [burst for burst in self.pop_bursts if burst.alive()]
 
-        self.laser = self.tracker.read()
-
         if self.receiver.poll():
             self.shot_count += 1
             shot_point = self.tracker.read_for_shot()
             self.laser = shot_point
             self.hit_test(shot_point)
             self.tracker.set_shot_feedback(self.last_shot_hit)
+
+    def update_menu(self):
+        if self.receiver.poll():
+            shot_point = self.tracker.read_for_shot()
+            self.laser = shot_point
+            hit = self.handle_menu_shot(shot_point)
+            self.tracker.set_shot_feedback(hit)
+
+    def update(self, dt):
+        self.laser = self.tracker.read()
+
+        if self.state == "play":
+            self.update_play(dt)
+            return
+
+        self.update_menu()
 
     def draw_balloon(self, b):
         color = self.balloon_color(b.kind)
@@ -1314,15 +1409,187 @@ class Game:
             2,
         )
 
+    def shot_status_text(self):
+        active_window = CONFIG.get(
+            "shot_status_duration_sec",
+            CONFIG.get("shot_cooldown_sec", 0.15),
+        )
+        if time.time() - self.receiver.last_shot <= active_window:
+            return "SHOT: ON"
+        return "SHOT: OFF"
+
+    def draw_status_panel(self, remain):
+        panel_x = CONFIG.get("ui_panel_x", 16)
+        panel_y = CONFIG.get("ui_panel_y", 16)
+        panel_w = CONFIG.get("ui_panel_width", 220)
+        panel_h = CONFIG.get("ui_panel_height", 118)
+
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill(CONFIG.get("ui_panel_color", (8, 12, 18, 150)))
+        self.screen.blit(panel, (panel_x, panel_y))
+
+        line_gap = CONFIG.get("ui_line_gap", 34)
+        label_color = CONFIG.get("ui_text_color", CONFIG["text_color"])
+        shot_active = self.shot_status_text() == "SHOT: ON"
+        shot_color = CONFIG.get(
+            "ui_shot_on_color" if shot_active else "ui_shot_off_color",
+            label_color,
+        )
+
+        lines = [
+            (f"Score {self.score}", label_color),
+            (f"Time  {remain}", label_color),
+            (self.shot_status_text(), shot_color),
+        ]
+
+        for index, (text, color) in enumerate(lines):
+            self.screen.blit(
+                self.font.render(text, True, color),
+                (panel_x + 16, panel_y + 12 + index * line_gap),
+            )
+
+    def draw_action_button(self, rect, icon, label):
+        panel = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+        panel.fill(CONFIG.get("action_button_color", (10, 14, 22, 185)))
+        self.screen.blit(panel, rect.topleft)
+
+        pygame.draw.rect(
+            self.screen,
+            CONFIG.get("action_button_outline_color", (78, 96, 112)),
+            rect,
+            2,
+            border_radius=26,
+        )
+
+        cx, cy = rect.center
+        icon_color = CONFIG.get("action_icon_color", (120, 138, 150))
+
+        if icon == "play":
+            points = [
+                (cx - 24, cy - 36),
+                (cx - 24, cy + 36),
+                (cx + 42, cy),
+            ]
+            pygame.draw.polygon(self.screen, icon_color, points)
+        elif icon == "score":
+            bar_width = 24
+            gaps = 10
+            heights = [36, 56, 82]
+            left = cx - (bar_width * 3 + gaps * 2) // 2
+            base_y = cy + 42
+            for index, height in enumerate(heights):
+                bar_rect = pygame.Rect(
+                    left + index * (bar_width + gaps),
+                    base_y - height,
+                    bar_width,
+                    height,
+                )
+                pygame.draw.rect(self.screen, icon_color, bar_rect, border_radius=8)
+        elif icon == "home":
+            roof = [
+                (cx, cy - 48),
+                (cx - 54, cy - 2),
+                (cx + 54, cy - 2),
+            ]
+            body = pygame.Rect(cx - 38, cy - 2, 76, 62)
+            door = pygame.Rect(cx - 12, cy + 22, 24, 38)
+            pygame.draw.polygon(self.screen, icon_color, roof)
+            pygame.draw.rect(self.screen, icon_color, body, border_radius=10)
+            pygame.draw.rect(
+                self.screen,
+                CONFIG["bg_color"],
+                door,
+                border_radius=8,
+            )
+
+        label_surface = self.small_font.render(
+            label,
+            True,
+            CONFIG.get("action_label_color", CONFIG["text_color"]),
+        )
+        self.screen.blit(
+            label_surface,
+            (
+                rect.centerx - label_surface.get_width() // 2,
+                rect.bottom - 34,
+            ),
+        )
+
+    def draw_center_message(self, title, subtitle=None, title_color=None, subtitle_color=None):
+        title_surface = self.big_font.render(
+            title,
+            True,
+            title_color or CONFIG["text_color"],
+        )
+        self.screen.blit(
+            title_surface,
+            (
+                CONFIG["screen_w"] // 2 - title_surface.get_width() // 2,
+                110,
+            ),
+        )
+
+        if subtitle:
+            subtitle_surface = self.small_font.render(
+                subtitle,
+                True,
+                subtitle_color or CONFIG.get("ui_text_color", CONFIG["text_color"]),
+            )
+            self.screen.blit(
+                subtitle_surface,
+                (
+                    CONFIG["screen_w"] // 2 - subtitle_surface.get_width() // 2,
+                    185,
+                ),
+            )
+
+    def draw_start_screen(self):
+        self.draw_center_message(
+            "LASER BALLOON",
+            "Shoot the play mark to start",
+        )
+        self.draw_action_button(self.action_buttons["start"], "play", "START")
+
+    def draw_score_prompt_screen(self):
+        self.draw_center_message(
+            "TIME UP",
+            "Shoot the score mark",
+        )
+        self.draw_action_button(self.action_buttons["score"], "score", "SHOW SCORE")
+
+    def draw_score_view_screen(self):
+        self.draw_center_message(
+            "YOUR SCORE",
+            "Shoot the home mark to return",
+            title_color=CONFIG.get("score_title_color", (56, 66, 76)),
+            subtitle_color=CONFIG.get("score_subtitle_color", (68, 80, 92)),
+        )
+
+        score_surface = self.huge_font.render(
+            str(self.final_score),
+            True,
+            CONFIG.get("score_value_color", (180, 198, 210)),
+        )
+        self.screen.blit(
+            score_surface,
+            (
+                CONFIG["screen_w"] // 2 - score_surface.get_width() // 2,
+                250,
+            ),
+        )
+
+        self.draw_action_button(self.action_buttons["home"], "home", "BACK")
+
     def draw(self):
 
         self.screen.fill(CONFIG["bg_color"])
 
-        for b in self.balloons:
-            self.draw_balloon(b)
+        if self.state == "play":
+            for b in self.balloons:
+                self.draw_balloon(b)
 
-        for burst in self.pop_bursts:
-            self.draw_pop_burst(burst)
+            for burst in self.pop_bursts:
+                self.draw_pop_burst(burst)
 
         if CONFIG.get("show_projected_laser_cursor", False) and self.laser is not None:
 
@@ -1353,54 +1620,14 @@ class Game:
             CONFIG["game_time_sec"] - int(time.time() - self.start_time),
         )
 
-        if CONFIG.get("show_ui_text", True):
-            self.screen.blit(
-                self.font.render(f"Score: {self.score}", True, CONFIG["text_color"]),
-                (20, 20),
-            )
-
-            self.screen.blit(
-                self.font.render(f"Combo: {self.combo}", True, CONFIG["text_color"]),
-                (20, 60),
-            )
-
-            self.screen.blit(
-                self.font.render(f"Time: {remain}", True, CONFIG["text_color"]),
-                (20, 100),
-            )
-
-            self.screen.blit(
-                self.font.render(
-                    f"Shots: {self.shot_count}",
-                    True,
-                    CONFIG["text_color"],
-                ),
-                (20, 140),
-            )
-
-            debug_lines = self.receiver.debug_lines() + self.tracker.debug_lines()
-
-            for index, line in enumerate(debug_lines):
-                self.screen.blit(
-                    self.small_font.render(line, True, CONFIG["text_color"]),
-                    (20, 185 + index * 28),
-                )
-
-        if self.game_over:
-
-            txt = self.big_font.render(
-                "GAME OVER",
-                True,
-                CONFIG["text_color"],
-            )
-
-            self.screen.blit(
-                txt,
-                (
-                    CONFIG["screen_w"] // 2 - txt.get_width() // 2,
-                    CONFIG["screen_h"] // 2 - 80,
-                ),
-            )
+        if self.state == "play" and CONFIG.get("show_ui_text", True):
+            self.draw_status_panel(remain)
+        elif self.state == "start":
+            self.draw_start_screen()
+        elif self.state == "score_prompt":
+            self.draw_score_prompt_screen()
+        elif self.state == "score_view":
+            self.draw_score_view_screen()
 
         pygame.display.flip()
 
