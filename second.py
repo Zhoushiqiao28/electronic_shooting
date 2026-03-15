@@ -4,7 +4,9 @@ import pygame
 import serial
 import time
 import random
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from serial.tools import list_ports
 from config import CONFIG
 
@@ -939,39 +941,213 @@ class SoundManager:
     def __init__(self):
         self.enabled = CONFIG.get("enable_sound", True)
         self.sounds = {}
+        self.bgm_channel = None
+        self.bgm_path = Path(__file__).with_name(CONFIG.get("bgm_file", "Energy.mp3"))
 
         if not self.enabled:
             return
 
         try:
             if pygame.mixer.get_init() is None:
-                pygame.mixer.init(frequency=44100, size=-16, channels=1)
+                pygame.mixer.init(frequency=44100, size=-16, channels=2)
+
+            pygame.mixer.set_num_channels(12)
+            pygame.mixer.set_reserved(1)
+            self.bgm_channel = pygame.mixer.Channel(0)
 
             self.sounds = {
-                "hit_normal": self.make_tone(880, 0.08, 0.22),
-                "hit_bonus": self.make_tone(1320, 0.12, 0.26),
-                "hit_bomb": self.make_tone(220, 0.18, 0.28),
-                "miss": self.make_tone(330, 0.09, 0.18),
-                "game_over": self.make_tone(180, 0.35, 0.22),
+                "shot": self.make_shot_sound(),
+                "pop": self.make_pop_sound(),
+                "miss": self.make_miss_sound(),
+                "game_over": self.make_game_over_sound(),
             }
+            if not self.bgm_path.exists():
+                self.sounds["bgm"] = self.make_bgm_loop()
+            self.start_bgm()
         except pygame.error:
             self.enabled = False
 
-    def make_tone(self, frequency, duration_sec, volume):
+    def audio_context(self):
         mixer_config = pygame.mixer.get_init()
         sample_rate = mixer_config[0] if mixer_config else 44100
-        channels = mixer_config[2] if mixer_config else 1
-        sample_count = max(1, int(sample_rate * duration_sec))
-        timeline = np.linspace(0, duration_sec, sample_count, False)
-        waveform = np.sin(2 * np.pi * frequency * timeline)
-        envelope = np.linspace(1.0, 0.0, sample_count)
-        audio = waveform * envelope * volume * CONFIG.get("sound_volume", 0.35)
-        audio = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+        channels = mixer_config[2] if mixer_config else 2
+        return sample_rate, channels
+
+    def build_sound(self, waveform, volume):
+        _, channels = self.audio_context()
+        master_volume = CONFIG.get("sound_volume", 0.35) * volume
+        audio = np.clip(waveform * 32767 * master_volume, -32768, 32767).astype(np.int16)
 
         if channels > 1:
             audio = np.repeat(audio[:, np.newaxis], channels, axis=1)
 
         return pygame.sndarray.make_sound(audio)
+
+    def build_envelope(self, sample_count, sample_rate, attack_sec, decay_rate):
+        attack_count = max(1, int(sample_rate * attack_sec))
+        envelope = np.exp(-np.linspace(0, decay_rate, sample_count))
+        envelope[:attack_count] = np.linspace(0.0, 1.0, attack_count)
+        return envelope
+
+    def make_shot_sound(self):
+        sample_rate, _ = self.audio_context()
+        duration_sec = CONFIG.get("shot_sound_duration_sec", 0.09)
+        sample_count = max(1, int(sample_rate * duration_sec))
+        freqs = np.linspace(2200, 540, sample_count)
+        phase = np.cumsum(2 * np.pi * freqs / sample_rate)
+        tone = 0.82 * np.sin(phase) + 0.18 * np.sin(phase * 1.8)
+        envelope = self.build_envelope(sample_count, sample_rate, 0.002, 8.5)
+        waveform = tone * envelope
+        return self.build_sound(waveform, CONFIG.get("shot_sound_volume", 0.92))
+
+    def make_pop_sound(self):
+        sample_rate, _ = self.audio_context()
+        duration_sec = CONFIG.get("pop_sound_duration_sec", 0.22)
+        sample_count = max(1, int(sample_rate * duration_sec))
+        freqs = np.linspace(520, 140, sample_count)
+        phase = np.cumsum(2 * np.pi * freqs / sample_rate)
+        rng = np.random.default_rng(7)
+        noise = rng.normal(0.0, 1.0, sample_count)
+        noise = np.convolve(noise, np.ones(9) / 9, mode="same")
+        tone = np.sin(phase) + 0.32 * np.sin(phase * 1.7)
+        body_envelope = self.build_envelope(sample_count, sample_rate, 0.001, 5.5)
+        crack_envelope = self.build_envelope(sample_count, sample_rate, 0.0005, 15.0)
+        waveform = 0.72 * tone * body_envelope + 0.48 * noise * crack_envelope
+        return self.build_sound(waveform, CONFIG.get("pop_sound_volume", 1.0))
+
+    def make_miss_sound(self):
+        sample_rate, _ = self.audio_context()
+        duration_sec = 0.11
+        sample_count = max(1, int(sample_rate * duration_sec))
+        freqs = np.linspace(420, 240, sample_count)
+        phase = np.cumsum(2 * np.pi * freqs / sample_rate)
+        tone = np.sin(phase)
+        envelope = self.build_envelope(sample_count, sample_rate, 0.003, 6.2)
+        waveform = tone * envelope
+        return self.build_sound(waveform, 0.22)
+
+    def make_game_over_sound(self):
+        sample_rate, _ = self.audio_context()
+        parts = []
+        for start_freq, end_freq, duration_sec in (
+            (240, 170, 0.18),
+            (180, 120, 0.24),
+        ):
+            sample_count = max(1, int(sample_rate * duration_sec))
+            freqs = np.linspace(start_freq, end_freq, sample_count)
+            phase = np.cumsum(2 * np.pi * freqs / sample_rate)
+            tone = np.sin(phase) + 0.2 * np.sin(phase * 0.5)
+            envelope = self.build_envelope(sample_count, sample_rate, 0.004, 4.5)
+            parts.append(tone * envelope)
+        waveform = np.concatenate(parts)
+        return self.build_sound(waveform, 0.4)
+
+    def make_bgm_loop(self):
+        sample_rate, _ = self.audio_context()
+        step_sec = CONFIG.get("bgm_step_sec", 0.32)
+        note_sec = CONFIG.get("bgm_note_sec", 0.26)
+        melody = [
+            659.25,
+            783.99,
+            880.00,
+            783.99,
+            659.25,
+            783.99,
+            987.77,
+            783.99,
+            587.33,
+            659.25,
+            783.99,
+            659.25,
+            523.25,
+            659.25,
+            783.99,
+            987.77,
+        ]
+        bassline = [
+            164.81,
+            164.81,
+            146.83,
+            146.83,
+            174.61,
+            174.61,
+            146.83,
+            146.83,
+        ]
+        duration_sec = step_sec * len(melody)
+        sample_count = max(1, int(sample_rate * duration_sec))
+        timeline = np.linspace(0, duration_sec, sample_count, False)
+        waveform = np.zeros(sample_count, dtype=np.float32)
+        rng = np.random.default_rng(11)
+
+        # Steady low synth bed.
+        waveform += 0.12 * np.sin(2 * np.pi * 110.0 * timeline)
+        waveform += 0.07 * np.sin(2 * np.pi * 220.0 * timeline + 0.25)
+
+        # Driving bass pulse.
+        bass_step = max(1, len(melody) // len(bassline))
+        for index, frequency in enumerate(bassline):
+            start = int(index * bass_step * step_sec * sample_rate)
+            end = min(sample_count, start + int((step_sec * bass_step) * sample_rate))
+            if end <= start:
+                continue
+            note_t = np.linspace(0, (end - start) / sample_rate, end - start, False)
+            phase = 2 * np.pi * frequency * note_t
+            pulse = np.sign(np.sin(phase))
+            tone = 0.16 * pulse + 0.08 * np.sin(phase)
+            envelope = np.exp(-np.linspace(0, 4.6, end - start))
+            waveform[start:end] += tone * envelope
+
+        for index, frequency in enumerate(melody):
+            start = int(index * step_sec * sample_rate)
+            end = min(sample_count, start + int(note_sec * sample_rate))
+            if end <= start:
+                continue
+            note_t = np.linspace(0, (end - start) / sample_rate, end - start, False)
+            phase = 2 * np.pi * frequency * note_t
+            pulse = np.sign(np.sin(phase))
+            note = 0.16 * pulse + 0.20 * np.sin(phase) + 0.07 * np.sin(phase * 2.0)
+            note_envelope = np.exp(-np.linspace(0, 3.8, end - start))
+            attack_count = max(1, int(sample_rate * 0.01))
+            note_envelope[:attack_count] = np.linspace(0.0, 1.0, attack_count)
+            waveform[start:end] += note * note_envelope
+
+            # Off-beat sparkle to keep the loop moving.
+            arp_start = start + int(step_sec * 0.5 * sample_rate)
+            arp_end = min(sample_count, arp_start + int(note_sec * 0.55 * sample_rate))
+            if arp_end > arp_start:
+                arp_t = np.linspace(0, (arp_end - arp_start) / sample_rate, arp_end - arp_start, False)
+                arp_phase = 2 * np.pi * (frequency * 2.0) * arp_t
+                arp = 0.10 * np.sin(arp_phase) + 0.04 * np.sin(arp_phase * 1.5)
+                arp_env = np.exp(-np.linspace(0, 5.0, arp_end - arp_start))
+                waveform[arp_start:arp_end] += arp * arp_env
+
+        # Lightweight kick and hi-hat for arcade momentum.
+        for beat_index in range(len(melody)):
+            beat_start = int(beat_index * step_sec * sample_rate)
+
+            if beat_index % 2 == 0:
+                kick_end = min(sample_count, beat_start + int(0.10 * sample_rate))
+                kick_t = np.linspace(0, (kick_end - beat_start) / sample_rate, kick_end - beat_start, False)
+                kick_freq = np.linspace(120.0, 42.0, kick_end - beat_start)
+                kick_phase = np.cumsum(2 * np.pi * kick_freq / sample_rate)
+                kick = 0.20 * np.sin(kick_phase)
+                kick_env = np.exp(-np.linspace(0, 8.0, kick_end - beat_start))
+                waveform[beat_start:kick_end] += kick * kick_env
+
+            hat_start = beat_start + int(step_sec * 0.5 * sample_rate)
+            hat_end = min(sample_count, hat_start + int(0.035 * sample_rate))
+            if hat_end > hat_start:
+                hat = rng.normal(0.0, 1.0, hat_end - hat_start)
+                hat = np.convolve(hat, np.array([1.0, -0.85]), mode="same")
+                hat_env = np.exp(-np.linspace(0, 10.0, hat_end - hat_start))
+                waveform[hat_start:hat_end] += 0.055 * hat * hat_env
+
+        fade_count = max(1, int(sample_rate * 0.05))
+        waveform[:fade_count] *= np.linspace(0.0, 1.0, fade_count)
+        waveform[-fade_count:] *= np.linspace(1.0, 0.0, fade_count)
+        waveform = np.tanh(waveform * 1.4)
+        return self.build_sound(waveform, CONFIG.get("bgm_volume", 0.24))
 
     def play(self, name):
         if not self.enabled:
@@ -979,15 +1155,42 @@ class SoundManager:
 
         sound = self.sounds.get(name)
         if sound is not None:
-            sound.play()
+            channel = pygame.mixer.find_channel()
+            if channel is not None:
+                channel.play(sound)
+            else:
+                sound.play()
+
+    def start_bgm(self):
+        if not self.enabled or not CONFIG.get("enable_bgm", True):
+            return
+
+        if self.bgm_path.exists():
+            try:
+                pygame.mixer.music.load(str(self.bgm_path))
+                pygame.mixer.music.set_volume(CONFIG.get("bgm_volume", 0.28))
+                pygame.mixer.music.play(-1)
+                return
+            except pygame.error:
+                pass
+
+        if self.bgm_channel is None:
+            return
+
+        bgm = self.sounds.get("bgm")
+        if bgm is not None and not self.bgm_channel.get_busy():
+            self.bgm_channel.play(bgm, loops=-1)
+
+    def stop(self):
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+        if self.bgm_channel is not None:
+            self.bgm_channel.stop()
 
     def play_hit(self, kind):
-        if kind == "bonus":
-            self.play("hit_bonus")
-        elif kind == "bomb":
-            self.play("hit_bomb")
-        else:
-            self.play("hit_normal")
+        self.play("pop")
 
 
 class Game:
@@ -1021,6 +1224,12 @@ class Game:
         self.running = True
         self.state = "start"
         self.final_score = 0
+        self.current_name = ""
+        self.today_ranking = []
+        self.last_saved_entry_id = None
+        self.ranking_file = Path(__file__).with_name(
+            CONFIG.get("daily_ranking_file", "daily_rankings.json")
+        )
 
         self.laser = None
 
@@ -1029,6 +1238,8 @@ class Game:
         self.last_shot_time = 0
         self.game_over_sound_played = False
         self.action_buttons = self.build_action_buttons()
+        self.name_buttons = self.build_name_buttons()
+        self.name_action_buttons = self.build_name_action_buttons()
 
     def create_display(self):
         flags = pygame.FULLSCREEN if self.fullscreen else 0
@@ -1041,6 +1252,8 @@ class Game:
         self.fullscreen = not self.fullscreen
         self.screen = self.create_display()
         self.action_buttons = self.build_action_buttons()
+        self.name_buttons = self.build_name_buttons()
+        self.name_action_buttons = self.build_name_action_buttons()
 
     def build_action_buttons(self):
         center_x = CONFIG["screen_w"] // 2
@@ -1059,8 +1272,117 @@ class Game:
         return {
             "start": make_rect(40),
             "score": make_rect(80),
-            "home": make_rect(150),
+            "name": make_rect(150),
+            "home": make_rect(180),
         }
+
+    def build_name_buttons(self):
+        rows = CONFIG.get(
+            "name_keyboard_rows",
+            ["ABCDEFG", "HIJKLMN", "OPQRSTU", "VWXYZ-"],
+        )
+        cols = max(len(row) for row in rows)
+        key_w = CONFIG.get("name_key_width", 92)
+        key_h = CONFIG.get("name_key_height", 68)
+        gap_x = CONFIG.get("name_key_gap_x", 12)
+        gap_y = CONFIG.get("name_key_gap_y", 12)
+        total_w = cols * key_w + (cols - 1) * gap_x
+        start_x = CONFIG["screen_w"] // 2 - total_w // 2
+        start_y = CONFIG.get("name_keyboard_y", 260)
+        buttons = {}
+
+        for row_index, row in enumerate(rows):
+            row_w = len(row) * key_w + max(0, len(row) - 1) * gap_x
+            row_x = CONFIG["screen_w"] // 2 - row_w // 2
+            for col_index, char in enumerate(row):
+                rect = pygame.Rect(
+                    row_x + col_index * (key_w + gap_x),
+                    start_y + row_index * (key_h + gap_y),
+                    key_w,
+                    key_h,
+                )
+                buttons[char] = rect
+
+        return buttons
+
+    def build_name_action_buttons(self):
+        labels = ["DEL", "CLEAR", "OK"]
+        button_w = CONFIG.get("name_action_width", 160)
+        button_h = CONFIG.get("name_action_height", 72)
+        gap = CONFIG.get("name_action_gap", 18)
+        total_w = len(labels) * button_w + (len(labels) - 1) * gap
+        start_x = CONFIG["screen_w"] // 2 - total_w // 2
+        y = CONFIG.get("name_action_y", 610)
+
+        return {
+            label: pygame.Rect(
+                start_x + index * (button_w + gap),
+                y,
+                button_w,
+                button_h,
+            )
+            for index, label in enumerate(labels)
+        }
+
+    def today_key(self):
+        return time.strftime("%Y-%m-%d")
+
+    def load_ranking_data(self):
+        if not self.ranking_file.exists():
+            return {}
+
+        try:
+            with self.ranking_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_ranking_data(self, data):
+        with self.ranking_file.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2)
+
+    def get_today_ranking(self):
+        data = self.load_ranking_data()
+        entries = data.get(self.today_key(), [])
+        if not isinstance(entries, list):
+            return []
+
+        sorted_entries = sorted(
+            entries,
+            key=lambda item: (
+                -int(item.get("score", 0)),
+                float(item.get("created_at", 0)),
+            ),
+        )
+        return sorted_entries[: CONFIG.get("daily_ranking_limit", 10)]
+
+    def save_today_score(self, name):
+        clean_name = name.strip().upper()
+        if not clean_name:
+            return False
+
+        data = self.load_ranking_data()
+        today = self.today_key()
+        entries = data.get(today, [])
+        if not isinstance(entries, list):
+            entries = []
+
+        entry_id = str(int(time.time() * 1000))
+        entries.append(
+            {
+                "id": entry_id,
+                "name": clean_name,
+                "score": int(self.final_score),
+                "shots": int(self.shot_count),
+                "created_at": time.time(),
+            }
+        )
+        data[today] = entries
+        self.save_ranking_data(data)
+        self.last_saved_entry_id = entry_id
+        self.today_ranking = self.get_today_ranking()
+        return True
 
     def reset_round(self):
         self.balloons = []
@@ -1078,6 +1400,9 @@ class Game:
     def start_round(self):
         self.reset_round()
         self.final_score = 0
+        self.current_name = ""
+        self.last_saved_entry_id = None
+        self.today_ranking = []
         self.state = "play"
 
     def finish_round(self):
@@ -1085,6 +1410,7 @@ class Game:
         self.balloons = []
         self.pop_bursts = []
         self.combo = 0
+        self.current_name = ""
         self.state = "score_prompt"
         if not self.game_over_sound_played:
             self.sound.play("game_over")
@@ -1096,6 +1422,7 @@ class Game:
         self.combo = 0
         self.last_shot_pos = None
         self.last_shot_hit = False
+        self.current_name = ""
         self.state = "start"
 
     def point_hits_button(self, point, button_key):
@@ -1118,10 +1445,53 @@ class Game:
             self.state = "score_view"
             return True
 
-        if self.state == "score_view" and self.point_hits_button(point, "home"):
+        if self.state == "score_view" and self.point_hits_button(point, "name"):
+            self.last_shot_hit = True
+            self.state = "name_entry"
+            return True
+
+        if self.state == "name_entry":
+            handled = self.handle_name_entry_shot(point)
+            self.last_shot_hit = handled
+            return handled
+
+        if self.state == "ranking_view" and self.point_hits_button(point, "home"):
             self.last_shot_hit = True
             self.return_to_start()
             return True
+
+        return False
+
+    def handle_name_entry_shot(self, point):
+        if point is None:
+            return False
+
+        max_length = CONFIG.get("player_name_max_length", 6)
+
+        for char, rect in self.name_buttons.items():
+            if rect.collidepoint(int(point[0]), int(point[1])):
+                if len(self.current_name) < max_length:
+                    self.current_name += char
+                    return True
+                return False
+
+        if self.name_action_buttons["DEL"].collidepoint(int(point[0]), int(point[1])):
+            if self.current_name:
+                self.current_name = self.current_name[:-1]
+                return True
+            return False
+
+        if self.name_action_buttons["CLEAR"].collidepoint(int(point[0]), int(point[1])):
+            if self.current_name:
+                self.current_name = ""
+                return True
+            return False
+
+        if self.name_action_buttons["OK"].collidepoint(int(point[0]), int(point[1])):
+            if self.save_today_score(self.current_name):
+                self.state = "ranking_view"
+                return True
+            return False
 
         return False
 
@@ -1223,6 +1593,13 @@ class Game:
 
         return 1
 
+    def balloon_hit_center(self, balloon):
+        # Compensate for camera/projector latency by pulling the hit area
+        # slightly back toward the balloon position the player still sees.
+        delay_sec = float(CONFIG.get("balloon_hit_compensation_sec", 0.0))
+        offset_y = float(CONFIG.get("balloon_hit_offset_y", 0.0))
+        return balloon.x, balloon.y + balloon.speed * delay_sec + offset_y
+
     def hit_test(self, point):
         self.last_shot_pos = point
         self.last_shot_hit = False
@@ -1240,8 +1617,9 @@ class Game:
             if not balloon.alive:
                 continue
 
-            dx = px - balloon.x
-            dy = py - balloon.y
+            hit_x, hit_y = self.balloon_hit_center(balloon)
+            dx = px - hit_x
+            dy = py - hit_y
 
             if dx * dx + dy * dy <= balloon.radius * balloon.radius:
 
@@ -1286,6 +1664,7 @@ class Game:
         self.pop_bursts = [burst for burst in self.pop_bursts if burst.alive()]
 
         if self.receiver.poll():
+            self.sound.play("shot")
             self.shot_count += 1
             shot_point = self.tracker.read_for_shot()
             self.laser = shot_point
@@ -1294,6 +1673,7 @@ class Game:
 
     def update_menu(self):
         if self.receiver.poll():
+            self.sound.play("shot")
             shot_point = self.tracker.read_for_shot()
             self.laser = shot_point
             hit = self.handle_menu_shot(shot_point)
@@ -1448,18 +1828,21 @@ class Game:
                 (panel_x + 16, panel_y + 12 + index * line_gap),
             )
 
-    def draw_action_button(self, rect, icon, label):
+    def draw_button_box(self, rect, fill_color=None, outline_color=None, border_radius=20):
         panel = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
-        panel.fill(CONFIG.get("action_button_color", (10, 14, 22, 185)))
+        panel.fill(fill_color or CONFIG.get("action_button_color", (10, 14, 22, 185)))
         self.screen.blit(panel, rect.topleft)
 
         pygame.draw.rect(
             self.screen,
-            CONFIG.get("action_button_outline_color", (78, 96, 112)),
+            outline_color or CONFIG.get("action_button_outline_color", (78, 96, 112)),
             rect,
             2,
-            border_radius=26,
+            border_radius=border_radius,
         )
+
+    def draw_action_button(self, rect, icon, label):
+        self.draw_button_box(rect, border_radius=26)
 
         cx, cy = rect.center
         icon_color = CONFIG.get("action_icon_color", (120, 138, 150))
@@ -1500,6 +1883,14 @@ class Game:
                 CONFIG["bg_color"],
                 door,
                 border_radius=8,
+            )
+        elif icon == "name":
+            tag_rect = pygame.Rect(cx - 48, cy - 30, 96, 56)
+            pygame.draw.rect(self.screen, icon_color, tag_rect, 2, border_radius=12)
+            dot = self.small_font.render("Aa", True, icon_color)
+            self.screen.blit(
+                dot,
+                (cx - dot.get_width() // 2, cy - dot.get_height() // 2 - 4),
             )
 
         label_surface = self.small_font.render(
@@ -1543,6 +1934,198 @@ class Game:
                 ),
             )
 
+    def draw_name_entry_screen(self):
+        self.draw_center_message(
+            "ENTER NAME",
+            "Shoot letters, then OK",
+            title_color=CONFIG.get("name_title_color", CONFIG["text_color"]),
+            subtitle_color=CONFIG.get("name_subtitle_color", CONFIG.get("ui_text_color")),
+        )
+
+        field_rect = pygame.Rect(
+            CONFIG["screen_w"] // 2 - 260,
+            180,
+            520,
+            64,
+        )
+        self.draw_button_box(
+            field_rect,
+            fill_color=CONFIG.get("name_field_color", (8, 12, 18, 180)),
+            outline_color=CONFIG.get("name_field_outline_color", (68, 82, 94)),
+            border_radius=18,
+        )
+
+        shown_name = self.current_name or "_" * CONFIG.get("player_name_min_length_hint", 3)
+        name_surface = self.big_font.render(
+            shown_name,
+            True,
+            CONFIG.get("name_value_color", (120, 136, 150)),
+        )
+        self.screen.blit(
+            name_surface,
+            (
+                field_rect.centerx - name_surface.get_width() // 2,
+                field_rect.centery - name_surface.get_height() // 2,
+            ),
+        )
+
+        hint = self.small_font.render(
+            f"MAX {CONFIG.get('player_name_max_length', 6)}",
+            True,
+            CONFIG.get("name_hint_color", (84, 96, 108)),
+        )
+        self.screen.blit(
+            hint,
+            (
+                field_rect.right + 18,
+                field_rect.centery - hint.get_height() // 2,
+            ),
+        )
+
+        for char, rect in self.name_buttons.items():
+            self.draw_button_box(
+                rect,
+                fill_color=CONFIG.get("name_key_color", (8, 12, 18, 170)),
+                outline_color=CONFIG.get("name_key_outline_color", (64, 78, 90)),
+                border_radius=14,
+            )
+            label_surface = self.font.render(
+                char,
+                True,
+                CONFIG.get("name_key_text_color", (116, 130, 142)),
+            )
+            self.screen.blit(
+                label_surface,
+                (
+                    rect.centerx - label_surface.get_width() // 2,
+                    rect.centery - label_surface.get_height() // 2,
+                ),
+            )
+
+        for action, rect in self.name_action_buttons.items():
+            self.draw_button_box(
+                rect,
+                fill_color=CONFIG.get("name_action_color", (10, 15, 22, 185)),
+                outline_color=CONFIG.get("name_action_outline_color", (74, 88, 100)),
+                border_radius=16,
+            )
+            label_surface = self.small_font.render(
+                action,
+                True,
+                CONFIG.get("name_action_text_color", (118, 132, 144)),
+            )
+            self.screen.blit(
+                label_surface,
+                (
+                    rect.centerx - label_surface.get_width() // 2,
+                    rect.centery - label_surface.get_height() // 2,
+                ),
+            )
+
+    def draw_ranking_screen(self):
+        self.today_ranking = self.get_today_ranking()
+        self.draw_center_message(
+            "TODAY RANKING",
+            self.today_key(),
+            title_color=CONFIG.get("ranking_title_color", CONFIG["text_color"]),
+            subtitle_color=CONFIG.get("ranking_subtitle_color", CONFIG.get("ui_text_color")),
+        )
+
+        display_count = CONFIG.get("daily_ranking_display_count", 10)
+        board_rect = pygame.Rect(
+            CONFIG["screen_w"] // 2 - 300,
+            210,
+            600,
+            CONFIG.get("ranking_board_height", 360),
+        )
+        self.draw_button_box(
+            board_rect,
+            fill_color=CONFIG.get("ranking_panel_color", (7, 11, 17, 180)),
+            outline_color=CONFIG.get("ranking_panel_outline_color", (60, 72, 84)),
+            border_radius=22,
+        )
+
+        entries = self.today_ranking[:display_count]
+        row_gap = 6
+        top_padding = 18
+        side_padding = 18
+        usable_rows = max(1, display_count)
+        usable_height = board_rect.height - top_padding * 2 - row_gap * (usable_rows - 1)
+        row_h = max(24, usable_height // usable_rows)
+        row_y = board_rect.y + top_padding
+        row_font = self.small_font if display_count >= 8 else self.font
+        rank_font = self.small_font
+
+        if not entries:
+            empty_surface = self.font.render(
+                "NO SCORES YET",
+                True,
+                CONFIG.get("ranking_empty_color", (86, 98, 110)),
+            )
+            self.screen.blit(
+                empty_surface,
+                (
+                    board_rect.centerx - empty_surface.get_width() // 2,
+                    board_rect.centery - empty_surface.get_height() // 2,
+                ),
+            )
+        else:
+            for index, entry in enumerate(entries, start=1):
+                row_rect = pygame.Rect(
+                    board_rect.x + side_padding,
+                    row_y,
+                    board_rect.width - side_padding * 2,
+                    row_h,
+                )
+                is_player = entry.get("id") == self.last_saved_entry_id
+                self.draw_button_box(
+                    row_rect,
+                    fill_color=CONFIG.get(
+                        "ranking_highlight_color" if is_player else "ranking_row_color",
+                        (12, 18, 26, 185) if is_player else (8, 12, 18, 120),
+                    ),
+                    outline_color=CONFIG.get(
+                        "ranking_highlight_outline_color" if is_player else "ranking_row_outline_color",
+                        (92, 108, 122) if is_player else (50, 62, 74),
+                    ),
+                    border_radius=14,
+                )
+
+                rank_surface = rank_font.render(
+                    f"{index}",
+                    True,
+                    CONFIG.get("ranking_rank_color", (112, 126, 138)),
+                )
+                name_surface = row_font.render(
+                    entry.get("name", "---"),
+                    True,
+                    CONFIG.get("ranking_name_color", (122, 138, 150)),
+                )
+                score_surface = row_font.render(
+                    str(entry.get("score", 0)),
+                    True,
+                    CONFIG.get("ranking_score_color", (132, 146, 158)),
+                )
+
+                self.screen.blit(
+                    rank_surface,
+                    (row_rect.x + 18, row_rect.centery - rank_surface.get_height() // 2),
+                )
+                self.screen.blit(
+                    name_surface,
+                    (row_rect.x + 64, row_rect.centery - name_surface.get_height() // 2),
+                )
+                self.screen.blit(
+                    score_surface,
+                    (
+                        row_rect.right - score_surface.get_width() - 22,
+                        row_rect.centery - score_surface.get_height() // 2,
+                    ),
+                )
+                row_y += row_h + row_gap
+
+        self.draw_action_button(self.action_buttons["home"], "home", "START")
+
     def draw_start_screen(self):
         self.draw_center_message(
             "LASER BALLOON",
@@ -1560,7 +2143,7 @@ class Game:
     def draw_score_view_screen(self):
         self.draw_center_message(
             "YOUR SCORE",
-            "Shoot the home mark to return",
+            "Shoot the name mark",
             title_color=CONFIG.get("score_title_color", (56, 66, 76)),
             subtitle_color=CONFIG.get("score_subtitle_color", (68, 80, 92)),
         )
@@ -1578,7 +2161,7 @@ class Game:
             ),
         )
 
-        self.draw_action_button(self.action_buttons["home"], "home", "BACK")
+        self.draw_action_button(self.action_buttons["name"], "name", "NAME")
 
     def draw(self):
 
@@ -1628,6 +2211,10 @@ class Game:
             self.draw_score_prompt_screen()
         elif self.state == "score_view":
             self.draw_score_view_screen()
+        elif self.state == "name_entry":
+            self.draw_name_entry_screen()
+        elif self.state == "ranking_view":
+            self.draw_ranking_screen()
 
         pygame.display.flip()
 
@@ -1695,6 +2282,7 @@ class Game:
 
         self.receiver.release()
         self.tracker.release()
+        self.sound.stop()
         pygame.quit()
 
 

@@ -7,17 +7,19 @@ CONFIG = {
     "window_title": "Laser Balloon Game",
 
     # ===== ゲーム基本 =====
-    "game_time_sec": 20,
+    "game_time_sec": 30,
     "spawn_interval": 0.8,
     "max_balloons": 12,
 
     # ===== 風船サイズ =====
-    "balloon_radius_min": 25,
-    "balloon_radius_max": 50,
+    "balloon_radius_min": 30,
+    "balloon_radius_max": 70,
 
     # ===== 風船速度 =====
     "balloon_speed_min": 100,
     "balloon_speed_max": 300,
+    "balloon_hit_compensation_sec": 0.12,
+    "balloon_hit_offset_y": 0,
 
     # ===== スポーン位置 =====
     "spawn_x_margin": 80,
@@ -31,8 +33,8 @@ CONFIG = {
 
     # ===== 得点 =====
     "score_normal": 30,
-    "score_bonus": 40,
-    "score_bomb": 50,
+    "score_bonus": 20,
+    "score_bomb": 10,
 
     # ===== コンボ =====
     "combo_x2_count": 5,
@@ -71,7 +73,7 @@ CONFIG = {
     "laser_hold_sec": 0.12,
 
     # ===== カメラ =====
-    "camera_index": 1,
+    "camera_index": 0,
     "camera_backend": "dshow",
     "camera_probe_indices": [0, 1, 2, 3, 4, 5],
     "camera_buffer_size": 1,
@@ -102,7 +104,16 @@ CONFIG = {
     "shot_hit_color": (90, 255, 180),
     "shot_miss_color": (80, 200, 255),
     "enable_sound": True,
-    "sound_volume": 0.8,
+    "sound_volume": 0.75,
+    "shot_sound_volume": 0.95,
+    "shot_sound_duration_sec": 0.09,
+    "pop_sound_volume": 1.0,
+    "pop_sound_duration_sec": 0.22,
+    "enable_bgm": True,
+    "bgm_file": "Energy.mp3",
+    "bgm_volume": 0.28,
+    "bgm_step_sec": 0.22,
+    "bgm_note_sec": 0.17,
 
     # ===== カーソル =====
     "show_projected_laser_cursor": False,
@@ -150,6 +161,46 @@ CONFIG = {
     "score_title_color": (52, 62, 72),
     "score_subtitle_color": (64, 76, 88),
     "score_value_color": (110, 124, 136),
+    "name_title_color": (72, 84, 96),
+    "name_subtitle_color": (84, 96, 108),
+    "name_field_color": (8, 12, 18, 180),
+    "name_field_outline_color": (66, 80, 92),
+    "name_value_color": (116, 132, 144),
+    "name_hint_color": (84, 96, 108),
+    "name_key_color": (8, 12, 18, 170),
+    "name_key_outline_color": (64, 78, 90),
+    "name_key_text_color": (116, 130, 142),
+    "name_action_color": (10, 15, 22, 185),
+    "name_action_outline_color": (74, 88, 100),
+    "name_action_text_color": (118, 132, 144),
+    "ranking_title_color": (72, 84, 96),
+    "ranking_subtitle_color": (84, 96, 108),
+    "ranking_panel_color": (7, 11, 17, 180),
+    "ranking_panel_outline_color": (60, 72, 84),
+    "ranking_row_color": (8, 12, 18, 120),
+    "ranking_row_outline_color": (50, 62, 74),
+    "ranking_highlight_color": (12, 18, 26, 185),
+    "ranking_highlight_outline_color": (92, 108, 122),
+    "ranking_rank_color": (112, 126, 138),
+    "ranking_name_color": (122, 138, 150),
+    "ranking_score_color": (132, 146, 158),
+    "ranking_empty_color": (86, 98, 110),
+    "player_name_max_length": 6,
+    "player_name_min_length_hint": 3,
+    "name_keyboard_rows": ["ABCDEFG", "HIJKLMN", "OPQRSTU", "VWXYZ-"],
+    "name_key_width": 92,
+    "name_key_height": 68,
+    "name_key_gap_x": 12,
+    "name_key_gap_y": 12,
+    "name_keyboard_y": 260,
+    "name_action_width": 160,
+    "name_action_height": 72,
+    "name_action_gap": 18,
+    "name_action_y": 610,
+    "daily_ranking_file": "daily_rankings.json",
+    "daily_ranking_limit": 10,
+    "daily_ranking_display_count": 10,
+    "ranking_board_height": 360,
 
     # ===== 投影補正 =====
     # カメラ画像上のスクリーン4点
